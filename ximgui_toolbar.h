@@ -3,8 +3,14 @@
 #pragma once
 
 #include "imgui.h"
+#include "imgui_internal.h" // ImGuiSettingsHandler - no public API for custom persisted settings exists;
+                            // this is the standard, if internal, extension point Dear ImGui itself uses
+                            // for its own Docking/Tables state, and is already included elsewhere in
+                            // this project's own code for similar reasons.
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -149,6 +155,13 @@ namespace ximgui::toolbar
     , const ImVec2& ToolbarPos
     ) noexcept
     {
+        // MarkIniSettingsDirty() below is the missing half of persistence, found live (direct user
+        // report: a dragged toolbar's NEW position never made it into imgui.ini, even after waiting -
+        // the file kept whatever an UNRELATED real ImGui window move had last frozen it at). Dear
+        // ImGui's autosave (io.IniSavingRate, default every 5s) only fires for handlers whose data was
+        // marked dirty; this host's items are plain fields mutated directly, with nothing of ImGui's
+        // own to notice the change and schedule a save - so without this call, RegisterSettingsHandler's
+        // own WriteAllFn was correct but simply never got invoked again after the very first save.
         ImGuiIO& IO = ImGui::GetIO();
         if (ImGui::IsItemActivated())
         {
@@ -158,6 +171,7 @@ namespace ximgui::toolbar
             ( IO.MousePos.x - ToolbarPos.x
             , IO.MousePos.y - ToolbarPos.y
             );
+            ImGui::MarkIniSettingsDirty();
         }
 
         if (!Item.m_bDragging)
@@ -170,9 +184,15 @@ namespace ximgui::toolbar
             , IO.MousePos.y - HostOrigin.y - Item.m_DragOffset.y
             );
             ClampFloatingToolbar(Item, HostSize);
+            ImGui::MarkIniSettingsDirty(); // every frame of an active drag - a kill mid-drag still has
+                                            // at most IniSavingRate's worth of position staleness,
+                                            // same tolerance ImGui's own window-drag persistence has.
         }
         else if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
         {
+            ImGui::MarkIniSettingsDirty(); // the edge/order/anchor assignment just below is the final,
+                                            // committed state for this drag - must be saved regardless
+                                            // of whether the live per-frame marks above already did.
             const ImVec2 FloatingPos
             ( HostOrigin.x + Item.m_FloatingPos.x
             , HostOrigin.y + Item.m_FloatingPos.y
@@ -604,6 +624,90 @@ namespace ximgui::toolbar
             for (std::size_t Order = 0; Order < EdgeOrder.size(); ++Order)
                 Host.m_Items[EdgeOrder[Order]].m_Order = static_cast<int>(Order);
         }
+    }
+
+    // Persists each item's user-adjustable placement (edge/axis/floating position+anchor/end-stack/
+    // order) into the SAME .ini file ImGui already writes window positions into (io.IniFilename) -
+    // toolbar_host_state itself is a plain in-memory struct with no serialization of its own, so
+    // without this a toolbar dragged to a new spot snaps back to its hardcoded registration default
+    // the next time the app launches. Deliberately does NOT persist m_HorizontalSize/m_VerticalSize
+    // (fixed by the caller at registration, never user-adjustable in this library) or any of the
+    // purely-transient per-frame fields (m_bDragging, m_DragOffset, m_bDropOrderPending,
+    // m_DropCoordinate, m_LastScreenPos, m_LastSize).
+    //
+    // Must be called once during setup, BEFORE the first ImGui::NewFrame() of the run - Dear ImGui
+    // loads io.IniFilename automatically on that first call, and only handlers already registered by
+    // then receive that load's ReadOpenFn/ReadLineFn callbacks.
+    //
+    // TypeName becomes the ini file's "[TypeName][Layout]" section header - give each distinct Host
+    // its own unique TypeName if more than one is ever registered in the same app (ImGui resolves a
+    // bracketed ini section to the FIRST handler registered under that exact TypeName, so two Hosts
+    // sharing one TypeName would both incorrectly resolve to whichever was registered first).
+    inline void RegisterSettingsHandler(toolbar_host_state& Host, const char* TypeName) noexcept
+    {
+        ImGuiSettingsHandler Handler;
+        Handler.TypeName = TypeName;
+        Handler.TypeHash = ImHashStr(TypeName);
+        Handler.UserData = &Host;
+        Handler.ReadOpenFn = [](ImGuiContext*, ImGuiSettingsHandler* pHandler, const char*) -> void*
+        {
+            // One shared entry ("[TypeName][Layout]") holds every item as its own line - there is
+            // exactly one Host per handler (see TypeName's own comment above), so the entry name
+            // itself is not distinguishing; always resolve to that Host.
+            return pHandler->UserData;
+        };
+        Handler.ReadLineFn = [](ImGuiContext*, ImGuiSettingsHandler*, void* pEntry, const char* pLine)
+        {
+            auto* pHost = static_cast<toolbar_host_state*>(pEntry);
+            char Name[128] = {};
+            int Edge = 0, FloatingAxis = 0, AnchorRight = 0, AnchorBottom = 0, EndStack = 0, Order = 0;
+            float PosX = 0.0f, PosY = 0.0f, AnchorOffsetX = 0.0f, AnchorOffsetY = 0.0f;
+            if (std::sscanf(pLine, "Item=%127[^,],%d,%d,%f,%f,%d,%d,%f,%f,%d,%d"
+                , Name, &Edge, &FloatingAxis, &PosX, &PosY, &AnchorRight, &AnchorBottom
+                , &AnchorOffsetX, &AnchorOffsetY, &EndStack, &Order) != 11)
+                return;
+
+            for (auto& Item : pHost->m_Items)
+            {
+                if (Item.m_Name == nullptr || std::strcmp(Item.m_Name, Name) != 0)
+                    continue;
+                Item.m_Edge = static_cast<toolbar_host_edge>(Edge);
+                Item.m_LastFloatingAxis = static_cast<axis>(FloatingAxis);
+                Item.m_FloatingPos = ImVec2(PosX, PosY);
+                Item.m_bFloatingAnchorRight = AnchorRight != 0;
+                Item.m_bFloatingAnchorBottom = AnchorBottom != 0;
+                Item.m_FloatingAnchorOffset = ImVec2(AnchorOffsetX, AnchorOffsetY);
+                Item.m_bEndStack = EndStack != 0;
+                Item.m_Order = Order;
+                break;
+            }
+            // At least one real entry was loaded - skip RenderToolbarHost's own first-time default
+            // placement (its "if (!Host.m_bInitialized)" block), which would otherwise overwrite
+            // exactly what was just restored the instant the first frame renders.
+            pHost->m_bInitialized = true;
+        };
+        Handler.WriteAllFn = [](ImGuiContext*, ImGuiSettingsHandler* pHandler, ImGuiTextBuffer* pOutBuf)
+        {
+            auto* pHost = static_cast<toolbar_host_state*>(pHandler->UserData);
+            pOutBuf->appendf("[%s][Layout]\n", pHandler->TypeName);
+            for (auto& Item : pHost->m_Items)
+            {
+                if (Item.m_Name == nullptr) continue;
+                pOutBuf->appendf("Item=%s,%d,%d,%.3f,%.3f,%d,%d,%.3f,%.3f,%d,%d\n"
+                    , Item.m_Name
+                    , static_cast<int>(Item.m_Edge)
+                    , static_cast<int>(Item.m_LastFloatingAxis)
+                    , Item.m_FloatingPos.x, Item.m_FloatingPos.y
+                    , Item.m_bFloatingAnchorRight ? 1 : 0
+                    , Item.m_bFloatingAnchorBottom ? 1 : 0
+                    , Item.m_FloatingAnchorOffset.x, Item.m_FloatingAnchorOffset.y
+                    , Item.m_bEndStack ? 1 : 0
+                    , Item.m_Order
+                    );
+            }
+            pOutBuf->append("\n");
+        };
+        ImGui::AddSettingsHandler(&Handler); // copies Handler in - the local going out of scope after this call is fine
     }
 }
 

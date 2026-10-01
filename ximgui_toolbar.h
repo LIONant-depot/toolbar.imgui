@@ -56,6 +56,10 @@ namespace ximgui::toolbar
     {
         std::vector<toolbar_host_item> m_Items;
         bool m_bInitialized = false;
+
+        // How the toolbar's own tooltip ("Drag toolbar") is drawn. Unset: a small plain tooltip, so the library works on its own. A host that has
+        // one hint window for everything binds it here.
+        void (*m_OnTooltip)(const char* pText) noexcept = nullptr;
     };
 
     inline bool IsHorizontalToolbarEdge(toolbar_host_edge Edge) noexcept
@@ -329,11 +333,15 @@ namespace ximgui::toolbar
                 if (bGripHovered)
                 {
                     ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
-                    ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.70f);
-                    ImGui::BeginTooltip();
-                    ImGui::TextUnformatted("Drag toolbar");
-                    ImGui::EndTooltip();
-                    ImGui::PopFont();
+                    if (Host.m_OnTooltip) Host.m_OnTooltip("Drag toolbar");
+                    else
+                    {
+                        ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 0.70f);
+                        ImGui::BeginTooltip();
+                        ImGui::TextUnformatted("Drag toolbar");
+                        ImGui::EndTooltip();
+                        ImGui::PopFont();
+                    }
                 }
 
                 ImDrawList* pDrawList = ImGui::GetWindowDrawList();
